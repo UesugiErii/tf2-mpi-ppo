@@ -1,9 +1,12 @@
-# tensorboard, save weight, exit, LearningRateSchedule, every_episode_reward
-# mpirun -n 9 --oversubscribe --allow-run-as-root python3 run.py
+# test OK
+# brain also contain a env
+# env dont count one episode reward, let brain do
+# mpirun -n 8 --oversubscribe --allow-run-as-root python3 run.py
 
 from mpi4py import MPI
 import numpy as np
 from datetime import datetime
+from atari_wrappers import *
 
 comm = MPI.COMM_WORLD
 size = comm.Get_size()
@@ -39,6 +42,10 @@ gamma = 0.99  # discount reward
 
 # brain
 if rank == 0:
+    #######################
+    # calc real v and adv #
+    #######################
+
     import numba
 
 
@@ -77,6 +84,10 @@ if rank == 0:
         return realv[:-1, :], adv  # end_v dont need
 
 
+    ###################
+    # TensorFlow Part #
+    ###################
+
     import tensorflow as tf
     import os
 
@@ -93,7 +104,7 @@ if rank == 0:
         def __init__(self, init_lr):
             super(CustomSchedule, self).__init__()
             self.lr = init_lr
-            self.max_learning_times = total_step * 3 // epochs // (size - 1)
+            self.max_learning_times = total_step * 3 // epochs // (size)
 
         def __call__(self, step):
             # step start from 0
@@ -107,6 +118,7 @@ if rank == 0:
 
     # optimizer = optim.Adam(learning_rate=CustomSchedule(learning_rate))  # linearly annealed
     optimizer = optim.Adam(learning_rate=0.001)  # no annealed
+
 
     class CNNModel(Model):
         def __init__(self):
@@ -179,48 +191,74 @@ if rank == 0:
 
     model = CNNModel()
 
-    total_state = np.empty((epochs, size - 1, 84, 84, k), dtype=np.float32)
-    total_v = np.empty((epochs + 1, size - 1), dtype=np.float32)
-    total_a = np.empty((epochs, size - 1), dtype=np.int32)
-    total_r = np.zeros((epochs, size - 1), dtype=np.float32)
-    total_done = np.zeros((epochs, size - 1), dtype=np.float32)
-    total_old_ap = np.zeros((epochs, size - 1, a_num), dtype=np.float32)  # old action probability
+    ########################
+    # define some variable #
+    ########################
+
+    total_state = np.empty((epochs, size, 84, 84, k), dtype=np.float32)
+    total_v = np.empty((epochs + 1, size), dtype=np.float32)
+    total_a = np.empty((epochs, size), dtype=np.int32)
+    total_r = np.zeros((epochs, size), dtype=np.float32)
+    total_done = np.zeros((epochs, size), dtype=np.float32)
+    total_old_ap = np.zeros((epochs, size, a_num), dtype=np.float32)  # old action probability
     recv_state_buf = np.empty((size, 84, 84, k), dtype=np.float32)  # use to recv data
 
     learning_step = 0
-    remain_step = total_step // (size - 1)
+    remain_step = total_step // (size)
 
-    all_reward = np.zeros((size - 1,), dtype=np.float32)  # Used to record the reward of each episode
-    one_episode_reward_index = 0  # all env episode index
+    all_reward = np.zeros((size,), dtype=np.float32)  # Used to record the reward of each episode
+    one_episode_reward_index = 0  # all env episode index in tensorboard
+    count_episode = [0] * size  # count episode index in every env
 
-    # loop
-    # ↓ <-------- ↑
-    # 1 -> 255 -> 1
+    ####################
+    # brain's env init #
+    ####################
+
+    env = gym.make(env_name)
+    env = WarpFrame(env, width=84, height=84, grayscale=True)
+    env = FrameStack(env, k=k)  # return (IMG_H , IMG_W ,k)
+
+    # random init
+    np.random.seed(rank)
+    env.seed(rank)
+
+    state = np.array(env.reset(), dtype=np.float32)
+    send_state_buf = state
+
+    ###########################
+    #      loop               #
+    #      ↓ <-------- ↑      #
+    #      1 -> 255 -> 1      #
+    ###########################
 
     # first one
     comm.Gather(send_state_buf, recv_state_buf, root=0)
     remain_step -= 1
-    current_state = recv_state_buf[1:size, :, :, :]
-    total_state[0, :, :, :, :] = current_state
+    total_state[0, :, :, :, :] = recv_state_buf
 
-    ap, v = model(current_state)
+    ap, v = model(recv_state_buf)
     ap = ap.numpy()
     v = v.numpy()
-    v.resize((size - 1,))
+    v.resize((size,))
 
     # scattering action
-    a = [np.random.choice(range(a_num), p=ap[i]) for i in range(size - 1)]
+    a = [np.random.choice(range(a_num), p=ap[i]) for i in range(size)]
     total_a[0, :] = a
-    a = [0] + a
     a = comm.scatter(a, root=0)
+
+    # brain's env get first action
+    state_, r, done, info = env.step(a)
+    if done:
+        state_ = np.array(env.reset(), dtype=np.float32)
+    state = np.array(state_, dtype=np.float32)
+    send_state_buf = state
+
 
     # recv other information
     r = comm.gather(r, root=0)
     done = comm.gather(done, root=0)
     info = comm.gather(info, root=0)
-    del r[0]
-    del done[0]
-    del info[0]
+
 
     total_v[0, :] = v
     total_r[0, :] = np.array(r, dtype=np.float32)
@@ -232,13 +270,7 @@ if rank == 0:
             one_episode_reward_index += 1
             all_reward[i] = 0
 
-
     total_old_ap[0, :] = np.array(ap, dtype=np.float32)
-
-    # reset other information
-    r = 0
-    done = 0
-    info = 0
 
     # 255+1 loop
     while 1:
@@ -249,27 +281,30 @@ if rank == 0:
             if not remain_step:
                 break  # leave for loop
 
-            current_state = recv_state_buf[1:size, :, :, :]
-            total_state[epoch, :, :, :, :] = current_state
+            total_state[epoch, :, :, :, :] = recv_state_buf
 
-            ap, v = model(current_state)
+            ap, v = model(recv_state_buf)
             ap = ap.numpy()
             v = v.numpy()
-            v.resize((size - 1,))
+            v.resize((size,))
 
             # scattering action
-            a = [np.random.choice(range(a_num), p=ap[i]) for i in range(size - 1)]
+            a = [np.random.choice(range(a_num), p=ap[i]) for i in range(size)]
             total_a[epoch, :] = a
-            a = [0] + a
             a = comm.scatter(a, root=0)
+
+            # brain's env step
+            state_, r, done, info = env.step(a)
+            if done:
+                state_ = np.array(env.reset(), dtype=np.float32)
+            state = np.array(state_, dtype=np.float32)
+            send_state_buf = state
 
             # recv other information
             r = comm.gather(r, root=0)
             done = comm.gather(done, root=0)
             info = comm.gather(info, root=0)
-            del r[0]
-            del done[0]
-            del info[0]
+
 
             total_v[epoch, :] = v
             total_r[epoch, :] = np.array(r, dtype=np.float32)
@@ -277,15 +312,14 @@ if rank == 0:
             all_reward += r
             for i, is_done in enumerate(done):
                 if is_done:
+                    print(i, count_episode[i], all_reward[i])
                     tf.summary.scalar('reward', data=all_reward[i], step=one_episode_reward_index)
                     one_episode_reward_index += 1
                     all_reward[i] = 0
+                    count_episode[i] += 1
             total_old_ap[epoch, :] = np.array(ap, dtype=np.float32)
 
-            # reset other information
-            r = 0
-            done = 0
-            info = 0
+
         if not remain_step:
             print(rank, 'finished')
             model.save_weights(weight_dir + str(learning_step), save_format='tf')
@@ -296,37 +330,39 @@ if rank == 0:
         remain_step -= 1  # After every recv data minus 1
         # if now remain_step == 0, then exit after last learning
 
-        current_state = recv_state_buf[1:size, :, :, :]
-
-        ap, v = model(current_state)  # dont need ap
+        ap, v = model(recv_state_buf)  # dont need ap
         v = v.numpy()
-        v.resize((size - 1,))
+        v.resize((size,))
         total_v[-1, :] = v
+
+        #######################
+        #    Learning Part    #
+        #######################
 
         # critic_v   advantage_v
         total_real_v, total_adv = calc_real_v_and_adv_GAE(total_v, total_r, total_done)
-        total_state.resize((epochs * (size - 1), 84, 84, k))
-        total_a.resize((epochs * (size - 1),))
-        total_old_ap.resize((epochs * (size - 1), a_num))
-        total_adv.resize((epochs * (size - 1),))
-        total_real_v.resize((epochs * (size - 1),))
+        total_state.resize((epochs * (size), 84, 84, k))
+        total_a.resize((epochs * (size),))
+        total_old_ap.resize((epochs * (size), a_num))
+        total_adv.resize((epochs * (size),))
+        total_real_v.resize((epochs * (size),))
 
-        print('learning' + '-' * 35 + str(learning_step) + '/' + str(total_step // epochs // (size - 1)))
+        print('learning' + '-' * 35 + str(learning_step) + '/' + str(total_step // epochs // (size)))
         for _ in range(3):
-            sample_index = np.random.choice(epochs * (size - 1), size=epochs * (size - 1) // 4)
+            sample_index = np.random.choice(epochs * (size), size=epochs * (size) // 4)
             loss = model.train(total_state[sample_index],
                                tf.one_hot(total_a, depth=a_num).numpy()[sample_index],
                                total_adv[sample_index], total_real_v[sample_index],
                                total_old_ap[sample_index])
         learning_step += 1
-        if learning_step % (total_step // epochs // (size - 1) // 200) == 0:  # recode 200 times
+        if learning_step % (total_step // epochs // (size) // 200) == 0:  # recode 200 times
             tf.summary.scalar('loss', data=loss, step=learning_step)
-        if learning_step % (total_step // epochs // (size - 1) // 3) == 0:  # recode 3 times
+        if learning_step % (total_step // epochs // (size) // 3) == 0:  # recode 3 times
             model.save_weights(weight_dir + str(learning_step), save_format='tf')
 
-        total_state.resize((epochs, size - 1, 84, 84, k))
-        total_a.resize((epochs, size - 1))
-        total_old_ap.resize((epochs, size - 1, a_num))
+        total_state.resize((epochs, size, 84, 84, k))
+        total_a.resize((epochs, size))
+        total_old_ap.resize((epochs, size, a_num))
 
         # exit after last learning
         if not remain_step:
@@ -334,25 +370,31 @@ if rank == 0:
             model.save_weights(weight_dir + str(learning_step), save_format='tf')
             break  # leave while 1
 
-        # move last one to first one
-        ap, v = model(current_state)
+        ##############################
+        # move last one to first one #
+        ##############################
+
+        ap, v = model(recv_state_buf)
         ap = ap.numpy()
         v = v.numpy()
-        v.resize((size - 1,))
+        v.resize((size,))
 
         # scattering action
-        a = [np.random.choice(range(a_num), p=ap[i]) for i in range(size - 1)]
+        a = [np.random.choice(range(a_num), p=ap[i]) for i in range(size)]
         total_a[0, :] = a
-        a = [0] + a
         a = comm.scatter(a, root=0)
+
+        # brain's env step
+        state_, r, done, info = env.step(a)
+        if done:
+            state_ = np.array(env.reset(), dtype=np.float32)
+        state = np.array(state_, dtype=np.float32)
+        send_state_buf = state
 
         # recv other information
         r = comm.gather(r, root=0)
         done = comm.gather(done, root=0)
         info = comm.gather(info, root=0)
-        del r[0]
-        del done[0]
-        del info[0]
 
         total_v[0, :] = v
         total_r[0, :] = np.array(r, dtype=np.float32)
@@ -360,9 +402,11 @@ if rank == 0:
         all_reward += r
         for i, is_done in enumerate(done):
             if is_done:
+                print(i, count_episode[i], all_reward[i])
                 tf.summary.scalar('reward', data=all_reward[i], step=one_episode_reward_index)
                 one_episode_reward_index += 1
                 all_reward[i] = 0
+                count_episode[i] += 1
         total_old_ap[0, :] = np.array(ap, dtype=np.float32)
 
         # reset other information
@@ -373,7 +417,6 @@ if rank == 0:
 
 # env
 else:
-    from atari_wrappers import *
 
     env = gym.make(env_name)
     env = WarpFrame(env, width=84, height=84, grayscale=True)
@@ -384,9 +427,7 @@ else:
     env.seed(rank)
 
     state = np.array(env.reset(), dtype=np.float32)
-    one_episode_reward = 0
-    count_episode = 0
-    remain_step = total_step // (size - 1)
+    remain_step = total_step // (size)
     while True:
         # send state
         send_state_buf = state
@@ -400,15 +441,11 @@ else:
         a = comm.scatter(a, root=0)
 
         state_, r, done, info = env.step(a)
-        one_episode_reward += r
         state_ = np.array(state_, dtype=np.float32)
 
         # Fix Bug: this should on send above
         if done:
             state_ = np.array(env.reset(), dtype=np.float32)
-            print(rank, count_episode, one_episode_reward)
-            count_episode += 1
-            one_episode_reward = 0
 
         # send other information
         r = comm.gather(r, root=0)
