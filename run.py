@@ -1,4 +1,4 @@
-# prepare all data
+# count one episode reward
 # mpirun -n 9 --oversubscribe python3 run.py
 
 from mpi4py import MPI
@@ -65,6 +65,9 @@ if rank == 0:
 
 
     import tensorflow as tf
+    import os
+
+    os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
     from tensorflow.python.keras import Model
     from tensorflow.python.keras.layers import Dense, Conv2D, Flatten
 
@@ -117,6 +120,7 @@ if rank == 0:
     ap = ap.numpy()
     v = v.numpy()
     v.resize((size - 1,))
+
 
     # scattering action
     a = [np.random.choice(range(a_num), p=ap[i]) for i in range(size - 1)]
@@ -200,7 +204,6 @@ if rank == 0:
         total_a.resize((epochs, size - 1))
         total_old_ap.resize((epochs, size - 1, a_num))
 
-
         # move last one to first one
         ap, v = model(current_state)
         ap = ap.numpy()
@@ -246,6 +249,8 @@ else:
         env.seed(rank)
 
         state = np.array(env.reset(), dtype=np.float32)
+        one_episode_reward = 0
+        count = 0
         while True:
             # send state
             send_state_buf = state
@@ -255,17 +260,20 @@ else:
             a = comm.scatter(a, root=0)
 
             state_, r, done, info = env.step(a)
+            one_episode_reward += r
             state_ = np.array(state_, dtype=np.float32)
 
+            # Fix Bug: this should on send above
             if done:
                 state_ = np.array(env.reset(), dtype=np.float32)
+                print(rank, count, one_episode_reward)
+                count += 1
+                one_episode_reward = 0
 
             # send other information
             r = comm.gather(r, root=0)
             done = comm.gather(done, root=0)
             info = comm.gather(info, root=0)
-
-
 
             state = state_
 
