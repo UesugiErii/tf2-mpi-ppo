@@ -1,4 +1,4 @@
-# count one episode reward
+# Learning: test OK
 # mpirun -n 9 --oversubscribe python3 run.py
 
 from mpi4py import MPI
@@ -19,6 +19,9 @@ info = 0  # info
 a = 0  # action
 
 # Hyperparameter
+beta = 0.01
+VFcoeff = 1
+clip_epsilon = 0.2
 epochs = 128  # horizon
 k = 4
 env_name = 'PongDeterministic-v4'  # env name
@@ -31,7 +34,8 @@ gamma = 0.99  # discount reward
 
 # brain
 if rank == 0:
-    def calc_realv_and_adv_GAE(v, r, done):
+
+    def calc_real_v_and_adv_GAE(v, r, done):
         length = r.shape[0]
         num = r.shape[1]
 
@@ -48,7 +52,7 @@ if rank == 0:
         return realv, adv
 
 
-    def calc_realv_and_adv(v, r, done):
+    def calc_real_v_and_adv(v, r, done):
         length = r.shape[0]
         num = r.shape[1]
 
@@ -70,6 +74,7 @@ if rank == 0:
     os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
     from tensorflow.python.keras import Model
     from tensorflow.python.keras.layers import Dense, Conv2D, Flatten
+    import tensorflow.keras.optimizers as optim
 
 
     class CNNModel(Model):
@@ -97,16 +102,54 @@ if rank == 0:
             v = self.d2(x)
             return ap, v
 
+        def loss(self, state, a, adv, real_v, old_ap):
+            res = self.call(state)
+            error = res[1][:, 0] - real_v
+            L = tf.reduce_sum(tf.square(error))
+
+            adv = tf.dtypes.cast(tf.stop_gradient(adv), tf.float32)
+            batch_size = state.shape[0]
+            all_act_prob = res[0]
+            selected_prob = tf.reduce_sum(a * all_act_prob, axis=1)
+            old_prob = tf.reduce_sum(a * old_ap, axis=1)
+
+            r = selected_prob / (old_prob + 1e-6)
+
+            H = -tf.reduce_sum(all_act_prob * tf.math.log(all_act_prob + 1e-6))
+
+            Lclip = tf.reduce_sum(
+                tf.minimum(
+                    tf.multiply(r, adv),
+                    tf.multiply(
+                        tf.clip_by_value(
+                            r,
+                            1 - clip_epsilon,
+                            1 + clip_epsilon
+                        ),
+                        adv
+                    )
+                )
+            )
+
+            return -(Lclip - VFcoeff * L + beta * H) / batch_size, Lclip, H, L
+
+        def total_grad(self, batch_state, batch_a, batch_adv, batch_real_v, batch_old_ap):
+            with tf.GradientTape() as tape:
+                loss_value, Lclip, H, L = self.loss(batch_state, batch_a, batch_adv, batch_real_v, batch_old_ap)
+
+            return tape.gradient(loss_value, self.trainable_weights), loss_value
+
 
     model = CNNModel()
+    optimizer = optim.Adam(learning_rate=0.001)
 
     total_state = np.empty((epochs, size - 1, 84, 84, k), dtype=np.float32)
     total_v = np.empty((epochs + 1, size - 1), dtype=np.float32)
-    total_a = np.empty((epochs, size - 1), dtype=np.float32)
+    total_a = np.empty((epochs, size - 1), dtype=np.int32)
     total_r = np.zeros((epochs, size - 1), dtype=np.float32)
     total_done = np.zeros((epochs, size - 1), dtype=np.float32)
-    total_old_ap = np.zeros((epochs, size - 1, a_num), dtype=np.float32)
-    recv_state_buf = np.empty((size, 84, 84, k), dtype=np.float32)
+    total_old_ap = np.zeros((epochs, size - 1, a_num), dtype=np.float32)  # old action probability
+    recv_state_buf = np.empty((size, 84, 84, k), dtype=np.float32)  # use to recv data
 
     # loop
     # ↓ <-------- ↑
@@ -120,7 +163,6 @@ if rank == 0:
     ap = ap.numpy()
     v = v.numpy()
     v.resize((size - 1,))
-
 
     # scattering action
     a = [np.random.choice(range(a_num), p=ap[i]) for i in range(size - 1)]
@@ -193,13 +235,25 @@ if rank == 0:
         v.resize((size - 1,))
         total_v[-1, :] = v
 
-        total_real_v, total_adv = calc_realv_and_adv_GAE(total_v, total_r, total_done)
+        # critic_v   advantage_v
+        total_real_v, total_adv = calc_real_v_and_adv_GAE(total_v, total_r, total_done)
         total_state.resize((epochs * (size - 1), 84, 84, k))
         total_a.resize((epochs * (size - 1),))
         total_old_ap.resize((epochs * (size - 1), a_num))
         total_adv.resize((epochs * (size - 1),))
-        total_real_v.reshape((epochs * (size - 1),))
-        # TODO: use all information update network
+        total_real_v.resize((epochs * (size - 1),))
+
+        print('learning----------------------------------')
+        for _ in range(3):
+            sample_index = np.random.choice(epochs * (size - 1), size=epochs * (size - 1) // 4)
+            grads, loss = model.total_grad(total_state[sample_index],
+                                           tf.one_hot(total_a, depth=a_num).numpy()[sample_index],
+                                           total_adv[sample_index],
+                                           total_real_v[sample_index],
+                                           total_old_ap[sample_index])
+            grads, grad_norm = tf.clip_by_global_norm(grads, 0.5)
+            optimizer.apply_gradients(zip(grads, model.trainable_weights))
+
         total_state.resize((epochs, size - 1, 84, 84, k))
         total_a.resize((epochs, size - 1))
         total_old_ap.resize((epochs, size - 1, a_num))
@@ -244,7 +298,7 @@ else:
         env = WarpFrame(env, width=84, height=84, grayscale=True)
         env = FrameStack(env, k=k)  # return (IMG_H , IMG_W ,k)
 
-        # random
+        # random init
         np.random.seed(rank)
         env.seed(rank)
 
