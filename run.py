@@ -1,26 +1,23 @@
-# test OK
-# brain also contain a env
-# env dont count one episode reward, let brain do
+# optimization
 # mpirun -n 8 --oversubscribe --allow-run-as-root python3 run.py
 
 from mpi4py import MPI
 import numpy as np
 from datetime import datetime
 from atari_wrappers import *
+import gym
 
 comm = MPI.COMM_WORLD
 size = comm.Get_size()
 rank = comm.Get_rank()
 
-# use to pass state
-send_state_buf = np.empty((84, 84, 1), dtype=np.float32)
-recv_state_buf = None
-
 # placeholder
-r = 0  # reward
-done = 0  # done
-info = 0  # info
-a = 0  # action
+send_state_buf = None  # use to send state
+recv_state_buf = None  # use to recv state
+r = None  # reward
+done = None  # done
+info = None  # info
+a = None  # action
 
 # parameter
 logdir = "./logs/scalars/" + datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -33,11 +30,14 @@ clip_epsilon = 0.2
 epochs = 128  # horizon
 k = 4
 env_name = 'PongDeterministic-v4'  # env name
-import gym
-
+# Dynamically get the number of actions
 env = gym.make(env_name)
-a_num = env.action_space.n  # env.action_space
-del env
+env = WarpFrame(env, width=84, height=84, grayscale=True)
+env = FrameStack(env, k=k)  # return (IMG_H , IMG_W ,k)
+a_num = env.action_space.n
+
+batch_size = epochs * size // 4
+
 gamma = 0.99  # discount reward
 
 # brain
@@ -58,7 +58,7 @@ if rank == 0:
 
         for t in range(length - 1, -1, -1):
             delta = r[t, :] + v[t + 1, :] * gamma * (1 - done[t, :]) - v[t, :]
-            adv[t, :] = delta + gamma * 0.95 * adv[t + 1, :] * (1 - done[t, :])
+            adv[t, :] = delta + gamma * 0.95 * adv[t + 1, :] * (1 - done[t, :])  # 0.95 is lambda
 
         adv = adv[:-1, :]
 
@@ -204,7 +204,7 @@ if rank == 0:
     recv_state_buf = np.empty((size, 84, 84, k), dtype=np.float32)  # use to recv data
 
     learning_step = 0
-    remain_step = total_step // (size)
+    remain_step = total_step // size
 
     all_reward = np.zeros((size,), dtype=np.float32)  # Used to record the reward of each episode
     one_episode_reward_index = 0  # all env episode index in tensorboard
@@ -213,10 +213,6 @@ if rank == 0:
     ####################
     # brain's env init #
     ####################
-
-    env = gym.make(env_name)
-    env = WarpFrame(env, width=84, height=84, grayscale=True)
-    env = FrameStack(env, k=k)  # return (IMG_H , IMG_W ,k)
 
     # random init
     np.random.seed(rank)
@@ -253,12 +249,10 @@ if rank == 0:
     state = np.array(state_, dtype=np.float32)
     send_state_buf = state
 
-
     # recv other information
     r = comm.gather(r, root=0)
     done = comm.gather(done, root=0)
     info = comm.gather(info, root=0)
-
 
     total_v[0, :] = v
     total_r[0, :] = np.array(r, dtype=np.float32)
@@ -296,7 +290,7 @@ if rank == 0:
             # brain's env step
             state_, r, done, info = env.step(a)
             if done:
-                state_ = np.array(env.reset(), dtype=np.float32)
+                state_ = env.reset()
             state = np.array(state_, dtype=np.float32)
             send_state_buf = state
 
@@ -304,7 +298,6 @@ if rank == 0:
             r = comm.gather(r, root=0)
             done = comm.gather(done, root=0)
             info = comm.gather(info, root=0)
-
 
             total_v[epoch, :] = v
             total_r[epoch, :] = np.array(r, dtype=np.float32)
@@ -318,7 +311,6 @@ if rank == 0:
                     all_reward[i] = 0
                     count_episode[i] += 1
             total_old_ap[epoch, :] = np.array(ap, dtype=np.float32)
-
 
         if not remain_step:
             print(rank, 'finished')
@@ -341,23 +333,61 @@ if rank == 0:
 
         # critic_v   advantage_v
         total_real_v, total_adv = calc_real_v_and_adv_GAE(total_v, total_r, total_done)
-        total_state.resize((epochs * (size), 84, 84, k))
-        total_a.resize((epochs * (size),))
-        total_old_ap.resize((epochs * (size), a_num))
-        total_adv.resize((epochs * (size),))
-        total_real_v.resize((epochs * (size),))
+        total_state.resize((epochs * size, 84, 84, k))
+        total_a.resize((epochs * size,))
+        total_old_ap.resize((epochs * size, a_num))
+        total_adv.resize((epochs * size,))
+        total_real_v.resize((epochs * size,))
 
-        print('learning' + '-' * 35 + str(learning_step) + '/' + str(total_step // epochs // (size)))
+        print('learning' + '-' * 35 + str(learning_step) + '/' + str(total_step // epochs // size))
+
+        # Speed comparison of different methods
+        # if learning_step == 100:
+        #     import time
+        #     start_time = time.time()
+        # if learning_step == 600:
+        #     print(time.time()-start_time)
+        #     break
+
+        # 242.6518578529358
         for _ in range(3):
-            sample_index = np.random.choice(epochs * (size), size=epochs * (size) // 4)
+            sample_index = np.random.choice(epochs * size, size=epochs * size // 4)
             loss = model.train(total_state[sample_index],
                                tf.one_hot(total_a, depth=a_num).numpy()[sample_index],
                                total_adv[sample_index], total_real_v[sample_index],
                                total_old_ap[sample_index])
+
+        # 259.6192126274109
+        # np.random.shuffle(total_state)
+        # np.random.shuffle(total_a)
+        # np.random.shuffle(total_adv)
+        # np.random.shuffle(total_real_v)
+        # np.random.shuffle(total_old_ap)
+        # for i in range(3):
+        #     loss = model.train(total_state[batch_size*i:batch_size*(i+1)],
+        #                        tf.one_hot(total_a[batch_size*i:batch_size*(i+1)], depth=a_num).numpy(),
+        #                        total_adv[batch_size*i:batch_size*(i+1)],
+        #                        total_real_v[batch_size*i:batch_size*(i+1)],
+        #                        total_old_ap[batch_size*i:batch_size*(i+1)])
+
+        # 322.28919196128845
+        # dataset = tf.data.Dataset.from_tensor_slices((total_state, total_a, total_adv, total_real_v, total_old_ap))
+        # dataset = dataset.prefetch(buffer_size=tf.data.experimental.AUTOTUNE).shuffle(
+        #     buffer_size=epochs * size // 4).batch(
+        #     epochs * size // 4)
+        # for i, data in enumerate(dataset):
+        #     if i == 3:
+        #         break
+        #     loss = model.train(data[0],
+        #                        tf.one_hot(data[1], depth=a_num).numpy(),
+        #                        data[2],
+        #                        data[3],
+        #                        data[4])
+
         learning_step += 1
-        if learning_step % (total_step // epochs // (size) // 200) == 0:  # recode 200 times
+        if learning_step % (total_step // epochs // size // 200) == 0:  # recode 200 times
             tf.summary.scalar('loss', data=loss, step=learning_step)
-        if learning_step % (total_step // epochs // (size) // 3) == 0:  # recode 3 times
+        if learning_step % (total_step // epochs // size // 3) == 0:  # recode 3 times
             model.save_weights(weight_dir + str(learning_step), save_format='tf')
 
         total_state.resize((epochs, size, 84, 84, k))
@@ -387,7 +417,7 @@ if rank == 0:
         # brain's env step
         state_, r, done, info = env.step(a)
         if done:
-            state_ = np.array(env.reset(), dtype=np.float32)
+            state_ = env.reset()
         state = np.array(state_, dtype=np.float32)
         send_state_buf = state
 
@@ -409,25 +439,15 @@ if rank == 0:
                 count_episode[i] += 1
         total_old_ap[0, :] = np.array(ap, dtype=np.float32)
 
-        # reset other information
-        r = 0
-        done = 0
-        info = 0
-
-
 # env
 else:
-
-    env = gym.make(env_name)
-    env = WarpFrame(env, width=84, height=84, grayscale=True)
-    env = FrameStack(env, k=k)  # return (IMG_H , IMG_W ,k)
 
     # random init
     np.random.seed(rank)
     env.seed(rank)
 
     state = np.array(env.reset(), dtype=np.float32)
-    remain_step = total_step // (size)
+    remain_step = total_step // size
     while True:
         # send state
         send_state_buf = state
