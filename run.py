@@ -1,4 +1,3 @@
-# optimization
 # mpirun -n 8 --oversubscribe --allow-run-as-root python3 run.py
 
 from mpi4py import MPI
