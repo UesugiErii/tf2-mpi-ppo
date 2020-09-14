@@ -1,5 +1,4 @@
-# prototype.py is used to simulate the process of sending and receiving data between brain and env
-# use to make sure that the process of sending and receiving data is right
+# Ensure the order of the data is correct
 # mpirun -n 9 --oversubscribe python3 run.py
 
 from mpi4py import MPI
@@ -23,53 +22,134 @@ a = 0  # action
 epochs = 128  # horizon
 k = 4
 
+# test variable, for unit test
+count = 0
+
 # brain
 if rank == 0:
+    total_state = np.empty((epochs + 1, size - 1, 84, 84, k), dtype=np.float32)
+    total_v = np.empty((epochs + 1, size - 1), dtype=np.float32)
+    total_a = np.empty((epochs, size - 1), dtype=np.float32)
+    total_r = np.zeros((epochs, size - 1), dtype=np.float32)
+    total_done = np.zeros((epochs, size - 1), dtype=np.float32)
+    # total_old_ap = np.zeros((epochs, size - 1, ), dtype=np.float32)
     recv_state_buf = np.empty((size, 84, 84, k), dtype=np.float32)
-    for epoch in range(epochs):
-        # recv state
+
+    # loop
+    # ↓ <-------- ↑
+    # 1 -> 255 -> 1
+    # first one
+    comm.Gather(send_state_buf, recv_state_buf, root=0)
+    current_state = recv_state_buf[1:size, :, :, :]
+    total_state[0, :, :, :, :] = current_state
+
+    assert current_state[2, 0, 0, 0] == 3 + count  # choose rank=3 to test
+
+    # TODO: calc v and action prob
+    # scattering action
+    a = [i + count for i in range(size)]
+    a = comm.scatter(a, root=0)
+
+    # recv other information
+    r = comm.gather(r, root=0)
+    done = comm.gather(done, root=0)
+    info = comm.gather(info, root=0)
+    assert r == [0] + [count + i for i in range(1, size)]
+    assert done == [0] + [count + i for i in range(1, size)]
+    assert info == [[0]] + [[count + i] for i in range(1, size)]
+
+    count += 1
+    # reset other information
+    r = 0
+    done = 0
+    info = [0]
+
+    # 255 loop ( Don't write exit conditions temporarily )
+    while 1:
+        for epoch in range(epochs - 1):
+            # recv state
+            comm.Gather(send_state_buf, recv_state_buf, root=0)
+
+            current_state = recv_state_buf[1:size, :, :, :]
+            total_state[epoch + 1, :, :, :, :] = current_state
+
+            assert current_state[2, 0, 0, 0] == 3 + count  # choose rank=3 to test
+
+            # TODO: calc v and action prob
+
+            # scattering action
+            a = [i + count for i in range(size)]
+            a = comm.scatter(a, root=0)
+
+            # recv other information
+            r = comm.gather(r, root=0)
+            done = comm.gather(done, root=0)
+            info = comm.gather(info, root=0)
+            assert r == [0] + [count + i for i in range(1, size)]
+            assert done == [0] + [count + i for i in range(1, size)]
+            assert info == [[0]] + [[count + i] for i in range(1, size)]
+            count += 1
+
+            # reset other information
+            r = 0
+            done = 0
+            info = [0]
+        # last one
         comm.Gather(send_state_buf, recv_state_buf, root=0)
-        for i in range(1, size):
-            assert recv_state_buf[i, 0, 0, 0] == i + epoch
+
+        current_state = recv_state_buf[1:size, :, :, :]
+        total_state[epoch + 1, :, :, :, :] = current_state
+
+        # TODO: calc v and action prob, only need v
+
+        # TODO: use all information update network
+
+        # move last one to first one
+        total_state[0, :, :, :, :] = current_state
+
+        assert current_state[2, 0, 0, 0] == 3 + count  # choose rank=3 to test
+        # TODO: calc v and action prob for current_state
 
         # scattering action
-        a = [i + epoch for i in range(size)]
+        a = [i + count for i in range(size)]
         a = comm.scatter(a, root=0)
-        assert a == 0 + epoch
 
         # recv other information
         r = comm.gather(r, root=0)
         done = comm.gather(done, root=0)
         info = comm.gather(info, root=0)
-
-        assert r == [0] + [epoch + i for i in range(1, size)]
-        assert done == [0] + [epoch + i for i in range(1, size)]
-        assert info == [[0]] + [[epoch + i] for i in range(1, size)]
+        assert r == [0] + [count + i for i in range(1, size)]
+        assert done == [0] + [count + i for i in range(1, size)]
+        assert info == [[0]] + [[count + i] for i in range(1, size)]
+        count += 1
 
         # reset other information
         r = 0
         done = 0
         info = [0]
+
+
 # env
 else:
-    for epoch in range(epochs):
+    while 1:
         # fake step()
-        state = np.zeros((84, 84, k), dtype=np.float32) + rank + epoch
-        r = rank + epoch
-        done = rank + epoch
-        info = [rank + epoch]
+        state = np.zeros((84, 84, k), dtype=np.float32) + rank + count
+        r = rank + count
+        done = rank + count
+        info = [rank + count]
 
         # send state
         send_state_buf = state
-        assert id(send_state_buf) == id(state)  # dont copy
         comm.Gather(send_state_buf, recv_state_buf, root=0)
 
         # get action
         a = comm.scatter(a, root=0)
-        assert a == rank + epoch
+
+        assert a == rank + count
 
         # send other information
         r = comm.gather(r, root=0)
         done = comm.gather(done, root=0)
         info = comm.gather(info, root=0)
-        assert r is None and done is None and info is None
+
+        count += 1
