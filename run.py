@@ -1,4 +1,4 @@
-# ensure that true env is work
+# Integrated neural network
 # mpirun -n 9 --oversubscribe python3 run.py
 
 from mpi4py import MPI
@@ -30,6 +30,39 @@ del env
 
 # brain
 if rank == 0:
+    import tensorflow as tf
+    from tensorflow.python.keras import Model
+    from tensorflow.python.keras.layers import Dense, Conv2D, Flatten
+
+
+    class CNNModel(Model):
+        def __init__(self):
+            super(CNNModel, self).__init__()
+            self.c1 = Conv2D(32, kernel_size=(8, 8), strides=(4, 4),
+                             activation='relu')
+            self.c2 = Conv2D(64, kernel_size=(4, 4), strides=(2, 2), activation='relu')
+            self.c3 = Conv2D(64, kernel_size=(3, 3), strides=(1, 1), activation='relu')
+            self.flatten = Flatten()
+            self.d1 = Dense(512, activation="relu")
+            self.d2 = Dense(1)  # C
+            self.d3 = Dense(a_num, activation='softmax')  # A
+            self.call(np.random.random((epochs, 84, 84, k)).astype(np.float32))
+
+        @tf.function
+        def call(self, inputs):
+            x = inputs / 255.0
+            x = self.c1(x)
+            x = self.c2(x)
+            x = self.c3(x)
+            x = self.flatten(x)
+            x = self.d1(x)
+            ap = self.d3(x)
+            v = self.d2(x)
+            return ap, v
+
+
+    model = CNNModel()
+
     total_state = np.empty((epochs + 1, size - 1, 84, 84, k), dtype=np.float32)
     total_v = np.empty((epochs + 1, size - 1), dtype=np.float32)
     total_a = np.empty((epochs, size - 1), dtype=np.float32)
@@ -46,17 +79,22 @@ if rank == 0:
     current_state = recv_state_buf[1:size, :, :, :]
     total_state[0, :, :, :, :] = current_state
 
+    ap, v = model(current_state)
+    ap = ap.numpy()
+    # v = v.numpy()
 
-    # TODO: calc v and action prob
+    # print(ap[0])
+    assert ap.shape == (size - 1, a_num)
+    assert v.shape == (size - 1, 1)
+
     # scattering action
-    a = [0 for i in range(size)]
+    a = [0] + [np.random.choice(range(a_num), p=ap[i]) for i in range(size - 1)]
     a = comm.scatter(a, root=0)
 
     # recv other information
     r = comm.gather(r, root=0)
     done = comm.gather(done, root=0)
     info = comm.gather(info, root=0)
-
 
     # reset other information
     r = 0
@@ -72,19 +110,19 @@ if rank == 0:
             current_state = recv_state_buf[1:size, :, :, :]
             total_state[epoch + 1, :, :, :, :] = current_state
 
-
-            # TODO: calc v and action prob
+            ap, v = model(current_state)
+            ap = ap.numpy()
+            assert ap.shape == (size - 1, a_num)
+            assert v.shape == (size - 1, 1)
 
             # scattering action
-            a = [0 for i in range(size)]
+            a = [0] + [np.random.choice(range(a_num), p=ap[i]) for i in range(size - 1)]
             a = comm.scatter(a, root=0)
 
             # recv other information
             r = comm.gather(r, root=0)
             done = comm.gather(done, root=0)
             info = comm.gather(info, root=0)
-
-
 
             # reset other information
             r = 0
@@ -96,24 +134,28 @@ if rank == 0:
         current_state = recv_state_buf[1:size, :, :, :]
         total_state[epoch + 1, :, :, :, :] = current_state
 
-        # TODO: calc v and action prob, only need v
+        ap, v = model(current_state)  # dont need ap
+        assert ap.shape == (size - 1, a_num)
+        assert v.shape == (size - 1, 1)
 
         # TODO: use all information update network
 
         # move last one to first one
         total_state[0, :, :, :, :] = current_state
 
-        # TODO: calc v and action prob for current_state
+        ap, v = model(current_state)
+        ap = ap.numpy()
+        assert ap.shape == (size - 1, a_num)
+        assert v.shape == (size - 1, 1)
 
         # scattering action
-        a = [0 for i in range(size)]
+        a = [0] + [np.random.choice(range(a_num), p=ap[i]) for i in range(size - 1)]
         a = comm.scatter(a, root=0)
 
         # recv other information
         r = comm.gather(r, root=0)
         done = comm.gather(done, root=0)
         info = comm.gather(info, root=0)
-
 
         # reset other information
         r = 0
@@ -148,7 +190,6 @@ else:
 
             if done:
                 state_ = np.array(env.reset(), dtype=np.float32)
-                print(rank, done)
 
             # send other information
             r = comm.gather(r, root=0)
