@@ -228,13 +228,15 @@ if rank == 0:
 
     # first one
     comm.Gather(send_state_buf, recv_state_buf, root=0)
-    remain_step -= 1
     total_state[0, :, :, :, :] = recv_state_buf
+    remain_step -= 1
 
     ap, v = model(recv_state_buf)
     ap = ap.numpy()
     v = v.numpy()
     v.resize((size,))
+    total_v[0, :] = v
+    total_old_ap[0, :] = np.array(ap, dtype=np.float32)
 
     # scattering action
     a = [np.random.choice(range(a_num), p=ap[i]) for i in range(size)]
@@ -253,7 +255,6 @@ if rank == 0:
     done = comm.gather(done, root=0)
     info = comm.gather(info, root=0)
 
-    total_v[0, :] = v
     total_r[0, :] = np.array(r, dtype=np.float32)
     total_done[0, :] = np.array(done, dtype=np.float32)
     all_reward += r
@@ -263,23 +264,24 @@ if rank == 0:
             one_episode_reward_index += 1
             all_reward[i] = 0
 
-    total_old_ap[0, :] = np.array(ap, dtype=np.float32)
 
     # 255+1 loop
     while 1:
         for epoch in range(1, epochs):
             # recv state
             comm.Gather(send_state_buf, recv_state_buf, root=0)
+            total_state[epoch, :, :, :, :] = recv_state_buf
             remain_step -= 1  # After every recv data minus 1
             if not remain_step:
                 break  # leave for loop
 
-            total_state[epoch, :, :, :, :] = recv_state_buf
 
             ap, v = model(recv_state_buf)
             ap = ap.numpy()
             v = v.numpy()
             v.resize((size,))
+            total_v[epoch, :] = v
+            total_old_ap[epoch, :] = np.array(ap, dtype=np.float32)
 
             # scattering action
             a = [np.random.choice(range(a_num), p=ap[i]) for i in range(size)]
@@ -298,7 +300,6 @@ if rank == 0:
             done = comm.gather(done, root=0)
             info = comm.gather(info, root=0)
 
-            total_v[epoch, :] = v
             total_r[epoch, :] = np.array(r, dtype=np.float32)
             total_done[epoch, :] = np.array(done, dtype=np.float32)
             all_reward += r
@@ -309,7 +310,6 @@ if rank == 0:
                     one_episode_reward_index += 1
                     all_reward[i] = 0
                     count_episode[i] += 1
-            total_old_ap[epoch, :] = np.array(ap, dtype=np.float32)
 
         if not remain_step:
             print(rank, 'finished')
@@ -321,7 +321,7 @@ if rank == 0:
         remain_step -= 1  # After every recv data minus 1
         # if now remain_step == 0, then exit after last learning
 
-        ap, v = model(recv_state_buf)  # dont need ap
+        _, v = model(recv_state_buf)  # dont need ap
         v = v.numpy()
         v.resize((size,))
         total_v[-1, :] = v
@@ -403,10 +403,13 @@ if rank == 0:
         # move last one to first one #
         ##############################
 
+        total_state[0, :, :, :, :] = recv_state_buf
         ap, v = model(recv_state_buf)
         ap = ap.numpy()
         v = v.numpy()
         v.resize((size,))
+        total_v[0, :] = v
+        total_old_ap[0, :] = np.array(ap, dtype=np.float32)
 
         # scattering action
         a = [np.random.choice(range(a_num), p=ap[i]) for i in range(size)]
@@ -425,7 +428,6 @@ if rank == 0:
         done = comm.gather(done, root=0)
         info = comm.gather(info, root=0)
 
-        total_v[0, :] = v
         total_r[0, :] = np.array(r, dtype=np.float32)
         total_done[0, :] = np.array(done, dtype=np.float32)
         all_reward += r
@@ -436,7 +438,6 @@ if rank == 0:
                 one_episode_reward_index += 1
                 all_reward[i] = 0
                 count_episode[i] += 1
-        total_old_ap[0, :] = np.array(ap, dtype=np.float32)
 
 # env
 else:
