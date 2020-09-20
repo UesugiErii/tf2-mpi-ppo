@@ -21,22 +21,30 @@ a = None  # action
 # parameter
 logdir = "./logs/scalars/" + datetime.now().strftime("%Y%m%d-%H%M%S")
 weight_dir = "./logs/weight/" + datetime.now().strftime("%Y%m%d-%H%M%S") + '/'
-learning_rate = 0.001
-total_step = 10 ** 7
+learning_rate = 0.00025
+is_annealed = False  # Decide whether the learning rate decreases linearly
+total_step = 1 * 10 ** 7
+clip_epsilon = 0.1
+epochs = 128  # horizon
+use_RNN = True
+
 beta = 0.01
 VFcoeff = 1
-clip_epsilon = 0.2
-epochs = 128  # horizon
-k = 4
+IMG_W = 84  # image width
+IMG_H = 84  # image height
+hidden_unit_num = 128
+if use_RNN:
+    k = 1
+else:
+    k = 4
 env_name = 'PongDeterministic-v4'  # env name
 # Dynamically get the number of actions
 env = gym.make(env_name)
-env = WarpFrame(env, width=84, height=84, grayscale=True)
+env = WarpFrame(env, width=IMG_W, height=IMG_H, grayscale=True)
 env = FrameStack(env, k=k)  # return (IMG_H , IMG_W ,k)
 a_num = env.action_space.n
 
 batch_size = epochs * size // 4
-
 gamma = 0.99  # discount reward
 
 # brain
@@ -92,7 +100,7 @@ if rank == 0:
 
     os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
     from tensorflow.python.keras import Model
-    from tensorflow.python.keras.layers import Dense, Conv2D, Flatten
+    from tensorflow.python.keras.layers import Dense, Conv2D, Flatten, LSTMCell
     import tensorflow.keras.optimizers as optim
 
     file_writer = tf.summary.create_file_writer(logdir + "/metrics")
@@ -115,8 +123,10 @@ if rank == 0:
             return self.last_lr
 
 
-    # optimizer = optim.Adam(learning_rate=CustomSchedule(learning_rate))  # linearly annealed
-    optimizer = optim.Adam(learning_rate=0.001)  # no annealed
+    if is_annealed:
+        optimizer = optim.Adam(learning_rate=CustomSchedule(learning_rate))  # linearly annealed
+    else:
+        optimizer = optim.Adam(learning_rate=learning_rate)  # no annealed
 
 
     class CNNModel(Model):
@@ -130,7 +140,7 @@ if rank == 0:
             self.d1 = Dense(512, activation="relu")
             self.d2 = Dense(1)  # C
             self.d3 = Dense(a_num, activation='softmax')  # A
-            self.call(np.random.random((epochs, 84, 84, k)).astype(np.float32))
+            self.call(np.random.random((epochs, IMG_H, IMG_W, k)).astype(np.float32))
 
         @tf.function
         def call(self, inputs):
@@ -145,7 +155,7 @@ if rank == 0:
             return ap, v
 
         @tf.function
-        def loss(self, state, a, adv, real_v, old_ap):
+        def loss(self, state, action_index, adv, real_v, old_ap):
             res = self.call(state)
             error = res[1][:, 0] - real_v
             L = tf.reduce_sum(tf.square(error))
@@ -153,8 +163,8 @@ if rank == 0:
             adv = tf.dtypes.cast(tf.stop_gradient(adv), tf.float32)
             batch_size = state.shape[0]
             all_act_prob = res[0]
-            selected_prob = tf.reduce_sum(a * all_act_prob, axis=1)
-            old_prob = tf.reduce_sum(a * old_ap, axis=1)
+            selected_prob = tf.reduce_sum(action_index * all_act_prob, axis=1)
+            old_prob = tf.reduce_sum(action_index * old_ap, axis=1)
 
             r = selected_prob / (old_prob + 1e-6)
 
@@ -188,19 +198,102 @@ if rank == 0:
             return loss_value
 
 
-    model = CNNModel()
+    class RNNModel(Model):
+        def __init__(self):
+            super(RNNModel, self).__init__()
+            self.c1 = Conv2D(32, kernel_size=(8, 8), strides=(4, 4),
+                             activation='relu')
+            self.c2 = Conv2D(64, kernel_size=(4, 4), strides=(2, 2), activation='relu')
+            self.c3 = Conv2D(64, kernel_size=(3, 3), strides=(1, 1), activation='relu')
+            self.flatten = Flatten()
+            self.d1 = Dense(512, activation="relu")
+            self.d2 = Dense(1)  # C
+            self.d3 = Dense(a_num, activation='softmax')  # A
+            self.lstm_cell = LSTMCell(hidden_unit_num)
+            self.call(
+                np.random.random((batch_size, IMG_H, IMG_W, k)).astype(np.float32),
+                tf.convert_to_tensor(np.zeros((batch_size, hidden_unit_num), dtype=np.float32)),
+                tf.convert_to_tensor(np.zeros((batch_size, hidden_unit_num), dtype=np.float32))
+            )
+
+        @tf.function
+        def call(self, inputs, h, c):
+            x = inputs / 255.0
+            x = self.c1(x)
+            x = self.c2(x)
+            x = self.c3(x)
+            x = self.flatten(x)
+            x = self.d1(x)
+            x, hc = self.lstm_cell(inputs=x, states=(h, c))
+            a = self.d3(x)
+            v = self.d2(x)
+            #            h      c
+            return a, v, hc[0], hc[1]
+
+        def loss(self, state, action_index, adv, real_v, old_ap, h, c):
+            res = self.call(state, h, c)
+            error = res[1][:, 0] - real_v
+            L = tf.reduce_sum(tf.square(error))
+
+            adv = tf.dtypes.cast(tf.stop_gradient(adv), tf.float32)
+            batch_size = state.shape[0]
+            all_act_prob = res[0]
+            selected_prob = tf.reduce_sum(action_index * all_act_prob, axis=1)
+            old_prob = tf.reduce_sum(action_index * old_ap, axis=1)
+
+            r = selected_prob / (old_prob + 1e-6)
+
+            H = -tf.reduce_sum(all_act_prob * tf.math.log(all_act_prob + 1e-6))
+
+            Lclip = tf.reduce_sum(
+                tf.minimum(
+                    tf.multiply(r, adv),
+                    tf.multiply(
+                        tf.clip_by_value(
+                            r,
+                            1 - clip_epsilon,
+                            1 + clip_epsilon
+                        ),
+                        adv
+                    )
+                )
+            )
+
+            return -(Lclip - VFcoeff * L + beta * H) / batch_size
+
+        @tf.function
+        def train(self, batch_state, batch_a, batch_adv, batch_real_v, batch_old_ap, batch_h, batch_c):
+            with tf.GradientTape() as tape:
+                loss_value = self.loss(batch_state, batch_a, batch_adv, batch_real_v, batch_old_ap, batch_h, batch_c)
+
+            grads = tape.gradient(loss_value, self.trainable_weights)
+            grads, grad_norm = tf.clip_by_global_norm(grads, 0.5)
+            optimizer.apply_gradients(zip(grads, model.trainable_weights))
+
+            return loss_value
+
+
+    if use_RNN:
+        model = RNNModel()
+    else:
+        model = CNNModel()
 
     ########################
     # define some variable #
     ########################
 
-    total_state = np.empty((epochs, size, 84, 84, k), dtype=np.float32)
+    if use_RNN:
+        total_h = np.empty((epochs + 1, size, hidden_unit_num), dtype=np.float32)
+        total_h[0] = 0
+        total_c = np.empty((epochs + 1, size, hidden_unit_num), dtype=np.float32)
+        total_c[0] = 0
+    total_state = np.empty((epochs, size, IMG_H, IMG_W, k), dtype=np.float32)
     total_v = np.empty((epochs + 1, size), dtype=np.float32)
     total_a = np.empty((epochs, size), dtype=np.int32)
     total_r = np.zeros((epochs, size), dtype=np.float32)
     total_done = np.zeros((epochs, size), dtype=np.float32)
     total_old_ap = np.zeros((epochs, size, a_num), dtype=np.float32)  # old action probability
-    recv_state_buf = np.empty((size, 84, 84, k), dtype=np.float32)  # use to recv data
+    recv_state_buf = np.empty((size, IMG_H, IMG_W, k), dtype=np.float32)  # use to recv data
 
     learning_step = 0
     remain_step = total_step // size
@@ -231,12 +324,15 @@ if rank == 0:
     total_state[0, :, :, :, :] = recv_state_buf
     remain_step -= 1
 
-    ap, v = model(recv_state_buf)
+    if use_RNN:
+        ap, v, total_h[1], total_c[1] = model(total_state[0], total_h[0], total_c[0])
+    else:
+        ap, v = model(recv_state_buf)
     ap = ap.numpy()
     v = v.numpy()
     v.resize((size,))
     total_v[0, :] = v
-    total_old_ap[0, :] = np.array(ap, dtype=np.float32)
+    total_old_ap[0, :] = ap
 
     # scattering action
     a = [np.random.choice(range(a_num), p=ap[i]) for i in range(size)]
@@ -263,7 +359,9 @@ if rank == 0:
             tf.summary.scalar('reward', data=all_reward[i], step=one_episode_reward_index)
             one_episode_reward_index += 1
             all_reward[i] = 0
-
+            if use_RNN:
+                total_h[1, i, :] = 0
+                total_c[1, i, :] = 0
 
     # 255+1 loop
     while 1:
@@ -275,13 +373,16 @@ if rank == 0:
             if not remain_step:
                 break  # leave for loop
 
-
-            ap, v = model(recv_state_buf)
+            if use_RNN:
+                ap, v, total_h[epoch + 1], total_c[epoch + 1] = \
+                    model(total_state[epoch], total_h[epoch], total_c[epoch])
+            else:
+                ap, v = model(recv_state_buf)
             ap = ap.numpy()
             v = v.numpy()
             v.resize((size,))
             total_v[epoch, :] = v
-            total_old_ap[epoch, :] = np.array(ap, dtype=np.float32)
+            total_old_ap[epoch, :] = ap
 
             # scattering action
             a = [np.random.choice(range(a_num), p=ap[i]) for i in range(size)]
@@ -310,6 +411,9 @@ if rank == 0:
                     one_episode_reward_index += 1
                     all_reward[i] = 0
                     count_episode[i] += 1
+                    if use_RNN:
+                        total_h[epoch + 1, i, :] = 0
+                        total_c[epoch + 1, i, :] = 0
 
         if not remain_step:
             print(rank, 'finished')
@@ -321,7 +425,12 @@ if rank == 0:
         remain_step -= 1  # After every recv data minus 1
         # if now remain_step == 0, then exit after last learning
 
-        _, v = model(recv_state_buf)  # dont need ap
+        # only need v
+        if use_RNN:
+            _, v, _, _ = \
+                model(recv_state_buf, total_h[epochs], total_c[epochs])
+        else:
+            _, v = model(recv_state_buf)
         v = v.numpy()
         v.resize((size,))
         total_v[-1, :] = v
@@ -332,11 +441,14 @@ if rank == 0:
 
         # critic_v   advantage_v
         total_real_v, total_adv = calc_real_v_and_adv_GAE(total_v, total_r, total_done)
-        total_state.resize((epochs * size, 84, 84, k))
+        total_state.resize((epochs * size, IMG_H, IMG_W, k))
         total_a.resize((epochs * size,))
         total_old_ap.resize((epochs * size, a_num))
         total_adv.resize((epochs * size,))
         total_real_v.resize((epochs * size,))
+        if use_RNN:
+            total_h.resize(((epochs + 1) * size, hidden_unit_num))
+            total_c.resize(((epochs + 1) * size, hidden_unit_num))
 
         print('learning' + '-' * 35 + str(learning_step) + '/' + str(total_step // epochs // size))
 
@@ -349,12 +461,22 @@ if rank == 0:
         #     break
 
         # 242.6518578529358
-        for _ in range(3):
-            sample_index = np.random.choice(epochs * size, size=epochs * size // 4)
-            loss = model.train(total_state[sample_index],
-                               tf.one_hot(total_a, depth=a_num).numpy()[sample_index],
-                               total_adv[sample_index], total_real_v[sample_index],
-                               total_old_ap[sample_index])
+        if use_RNN:
+            for _ in range(3):
+                sample_index = np.random.choice(epochs * size, size=epochs * size // 4)
+                loss = model.train(total_state[sample_index],
+                                   tf.one_hot(total_a, depth=a_num).numpy()[sample_index],
+                                   total_adv[sample_index], total_real_v[sample_index],
+                                   total_old_ap[sample_index],
+                                   total_h[sample_index],
+                                   total_c[sample_index])
+        else:
+            for _ in range(3):
+                sample_index = np.random.choice(epochs * size, size=epochs * size // 4)
+                loss = model.train(total_state[sample_index],
+                                   tf.one_hot(total_a, depth=a_num).numpy()[sample_index],
+                                   total_adv[sample_index], total_real_v[sample_index],
+                                   total_old_ap[sample_index])
 
         # 259.6192126274109
         # np.random.shuffle(total_state)
@@ -386,12 +508,15 @@ if rank == 0:
         learning_step += 1
         if learning_step % (total_step // epochs // size // 200) == 0:  # recode 200 times
             tf.summary.scalar('loss', data=loss, step=learning_step)
-        if learning_step % (total_step // epochs // size // 3) == 0:  # recode 3 times
-            model.save_weights(weight_dir + str(learning_step), save_format='tf')
+        # if learning_step % (total_step // epochs // size // 3) == 0:  # recode 3 times
+        #     model.save_weights(weight_dir + str(learning_step), save_format='tf')
 
-        total_state.resize((epochs, size, 84, 84, k))
+        total_state.resize((epochs, size, IMG_H, IMG_W, k))
         total_a.resize((epochs, size))
         total_old_ap.resize((epochs, size, a_num))
+        if use_RNN:
+            total_h.resize(((epochs + 1), size, hidden_unit_num))
+            total_c.resize(((epochs + 1), size, hidden_unit_num))
 
         # exit after last learning
         if not remain_step:
@@ -404,12 +529,19 @@ if rank == 0:
         ##############################
 
         total_state[0, :, :, :, :] = recv_state_buf
-        ap, v = model(recv_state_buf)
+        if use_RNN:
+            total_h[0] = total_h[-1]
+            total_c[0] = total_c[-1]
+        if use_RNN:
+            ap, v, total_h[1], total_c[1] = model(total_state[0], total_h[0], total_c[0])
+        else:
+            ap, v = model(total_state[0])
+
         ap = ap.numpy()
         v = v.numpy()
         v.resize((size,))
         total_v[0, :] = v
-        total_old_ap[0, :] = np.array(ap, dtype=np.float32)
+        total_old_ap[0, :] = ap
 
         # scattering action
         a = [np.random.choice(range(a_num), p=ap[i]) for i in range(size)]
@@ -438,6 +570,9 @@ if rank == 0:
                 one_episode_reward_index += 1
                 all_reward[i] = 0
                 count_episode[i] += 1
+                if use_RNN:
+                    total_h[1, i, :] = 0
+                    total_c[1, i, :] = 0
 
 # env
 else:

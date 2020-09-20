@@ -1,6 +1,6 @@
 *.pyc
-./__pycache__/
+__pycache__/
 .idea/
 .git/
-./logs/
-./test/
+logs/
+test/
