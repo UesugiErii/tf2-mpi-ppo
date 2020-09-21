@@ -19,8 +19,9 @@ info = None  # info
 a = None  # action
 
 # parameter
-logdir = "./logs/scalars/" + datetime.now().strftime("%Y%m%d-%H%M%S")
-weight_dir = "./logs/weight/" + datetime.now().strftime("%Y%m%d-%H%M%S") + '/'
+work_dir = os.path.dirname(os.path.abspath(__file__))
+logdir = work_dir + "/logs/scalars/" + datetime.now().strftime("%Y%m%d-%H%M%S")
+weight_dir = work_dir + "/logs/weight/" + datetime.now().strftime("%Y%m%d-%H%M%S") + '/'
 learning_rate = 0.00025
 is_annealed = False  # Decide whether the learning rate decreases linearly
 total_step = 1 * 10 ** 7
